@@ -12,10 +12,22 @@ except ImportError:
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+
+def load_tokenizer(tokenizer_path: str):
+    kwargs = {}
+    try:
+        from config import TRUST_REMOTE_CODE
+        if TRUST_REMOTE_CODE:
+            kwargs["trust_remote_code"] = True
+    except ImportError:
+        pass
+    return AutoTokenizer.from_pretrained(tokenizer_path, **kwargs)
+
+
 def create_dataset(tokenizer_path: str, input_len: int, number: int, prefix_flag):
 
     logging.info(f"加载tokenizer: {tokenizer_path}")
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+    tokenizer = load_tokenizer(tokenizer_path)
 
     output_samples = []
     attempts = 0
@@ -90,7 +102,7 @@ def generate_unique_tokens(tokenizer_path, seed, n, number):
     torch.manual_seed(seed)
 
     # 加载 tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+    tokenizer = load_tokenizer(tokenizer_path)
 
     # 获取词表大小
     vocab_size = len(tokenizer)
@@ -160,6 +172,27 @@ def write_data(path, dataset, num):
             f.write(json.dumps({"question": item, "answer": "none"}, ensure_ascii=False))
             f.write("\n")
 
+def sample_bucket_lengths(rng, data_num, buckets):
+    """
+    按桶比例采样 token 长度。
+    buckets: [(min_len, max_len, ratio), ...]，ratio 之和应为 1.0
+    """
+    target_lens = []
+    assigned = 0
+    for idx, (lo, hi, ratio) in enumerate(buckets):
+        lo, hi = max(1, int(lo)), max(1, int(hi))
+        if lo > hi:
+            lo, hi = hi, lo
+        count = int(round(data_num * ratio))
+        if idx == len(buckets) - 1:
+            count = data_num - assigned
+        for _ in range(count):
+            target_lens.append(rng.randint(lo, hi))
+        assigned += count
+    rng.shuffle(target_lens)
+    return target_lens
+
+
 def sample_target_length(rng, fixed_length, length_mean=None, length_std=None, length_min=None, length_max=None):
     """从高斯或均匀分布中采样目标长度"""
     fixed_length = max(1, int(fixed_length))
@@ -227,7 +260,7 @@ def create_multi_prefix_dataset(tokenizer_path: str, input_len: int, number: int
             if long_texts is None:
                 logging.error("生成数据集失败，请清空picked ids")
                 exit(0)
-            tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+            tokenizer = load_tokenizer(tokenizer_path)
             dataset = []
             pbar = tqdm(total=number, desc="Truncating to variable lengths", unit="row") if tqdm else None
             for i, rl in enumerate(real_lens):
@@ -297,13 +330,9 @@ def create_multi_prefix_dataset(tokenizer_path: str, input_len: int, number: int
     return prefix_path, dataset_path
 
 
-def _create_prefix_dataset_variable(tokenizer_path, input_len, number, save_path, base_name, dp, repeat_rate, seed, prefix_num,
-                                    length_mean, length_std, length_min, length_max):
-    """变长前缀数据集生成：预采样长度 → 前缀池 → 逐条截断前缀/后缀并拼接"""
-    rng = random.Random(seed)
-
-    # 预采样每条数据的实际长度和公共前缀长度
-    real_lens = [max(1, int(sample_target_length(rng, input_len, length_mean, length_std, length_min, length_max))) for _ in range(number)]
+def _create_prefix_dataset_from_lengths(tokenizer_path, real_lens, number, save_path, base_name, dp, repeat_rate, seed,
+                                        prefix_num, length_tag):
+    """按预采样长度列表生成变长前缀数据集"""
     common_lens = [max(0, min(rl, int(round(rl * repeat_rate)))) for rl in real_lens]
     max_common_len = max(common_lens) if common_lens else 0
 
@@ -341,7 +370,7 @@ def _create_prefix_dataset_variable(tokenizer_path, input_len, number, save_path
         logging.error("生成后缀数据集失败，请清空picked ids")
         exit(0)
 
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+    tokenizer = load_tokenizer(tokenizer_path)
 
     # 逐条拼接
     dataset = []
@@ -373,7 +402,6 @@ def _create_prefix_dataset_variable(tokenizer_path, input_len, number, save_path
     if pbar:
         pbar.close()
 
-    length_tag = _build_length_tag(input_len, length_mean, length_std, length_min, length_max)
     dataset_path = os.path.join(save_path, f'GSM8K-{length_tag}-num{number}-{base_name}-repeatRate{repeat_rate}.jsonl')
     write_data(dataset_path, dataset, number)
 
@@ -381,6 +409,29 @@ def _create_prefix_dataset_variable(tokenizer_path, input_len, number, save_path
     logging.info(f"  avg_hit_ratio={sum(c / r for c, r in zip(common_lens, real_lens)) / len(real_lens):.2%}")
 
     return prefix_path, dataset_path
+
+
+def _create_prefix_dataset_variable(tokenizer_path, input_len, number, save_path, base_name, dp, repeat_rate, seed, prefix_num,
+                                    length_mean, length_std, length_min, length_max):
+    """变长前缀数据集生成：预采样长度 → 前缀池 → 逐条截断前缀/后缀并拼接"""
+    rng = random.Random(seed)
+    real_lens = [max(1, int(sample_target_length(rng, input_len, length_mean, length_std, length_min, length_max))) for _ in range(number)]
+    length_tag = _build_length_tag(input_len, length_mean, length_std, length_min, length_max)
+    return _create_prefix_dataset_from_lengths(
+        tokenizer_path, real_lens, number, save_path, base_name, dp, repeat_rate, seed, prefix_num, length_tag
+    )
+
+
+def create_prefix_dataset_bucketed(tokenizer_path, number, save_path, buckets, repeat_rate, seed, prefix_num=1, dp=1):
+    """按多桶长度分布生成 prefix cache 数据集"""
+    rng = random.Random(seed)
+    real_lens = sample_bucket_lengths(rng, number, buckets)
+    base_name = os.path.basename(os.path.normpath(tokenizer_path))
+    bucket_tag = "M" + "_".join(f"{int(lo)}_{int(hi)}_{int(ratio * 100)}" for lo, hi, ratio in buckets)
+    length_tag = bucket_tag
+    return _create_prefix_dataset_from_lengths(
+        tokenizer_path, real_lens, number, save_path, base_name, dp, repeat_rate, seed, prefix_num, length_tag
+    )
 
 def parse_prefix_ratio(r: str) -> float:
     """
